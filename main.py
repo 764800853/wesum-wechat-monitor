@@ -2,6 +2,7 @@
 """
 WeSum - 微信公众号摘要推送助手
 主程序：多公众号订阅、AI摘要、智能推送
+（本版本已改造：推送通道支持 PushPlus，优先于企业微信 Webhook）
 """
 
 import sys
@@ -62,10 +63,11 @@ LLM_BASE_URL = (
 # 模型名称（以各服务商文档中的模型 ID 为准）
 WECHAT_MODEL = os.getenv("WECHAT_MODEL") or "qwen-plus"
 
-# 企业微信 Webhook URL（必需）
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-if not WEBHOOK_URL:
-    raise ValueError("请设置环境变量 WEBHOOK_URL（在 .env 文件中）")
+# 推送配置：PushPlus Token 或 企业微信 Webhook 二选一（PushPlus 优先）
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN", "")
+if not WEBHOOK_URL and not PUSHPLUS_TOKEN:
+    raise ValueError("请设置环境变量 PUSHPLUS_TOKEN 或 WEBHOOK_URL（见 .env.example）")
 
 # GitHub Token（可选，用于创建 Gist）
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
@@ -803,14 +805,77 @@ def format_push_message_for_gist(articles, title="公众号文章摘要汇总"):
     return content
 
 
-# ==================== 企业微信推送函数 ====================
+# ==================== 推送函数（PushPlus / 企业微信 双通道） ====================
 
 # 企业微信 markdown 消息上限 4096 字节，留余量
 WECOM_MAX_BYTES = 4000
 
 
+def _post_markdown_message(webhook_url, title, markdown_content):
+    """
+    统一推送出口：优先走 PushPlus，其次企业微信 Webhook
+
+    Args:
+        webhook_url: 企业微信 webhook 地址（PushPlus 模式下忽略）
+        title: 消息标题（仅 PushPlus 使用）
+        markdown_content: markdown 格式正文
+
+    Returns:
+        推送成功返回 True，否则 False
+    """
+    # 通道一：PushPlus（消息直达微信"pushplus 推送加"公众号）
+    if PUSHPLUS_TOKEN:
+        # PushPlus 不识别企业微信的 <font> 标签，先剥掉
+        content = re.sub(r'</?font[^>]*>', '', markdown_content)
+        try:
+            resp = requests.post(
+                "https://www.pushplus.plus/send",
+                json={
+                    "token": PUSHPLUS_TOKEN,
+                    "title": title,
+                    "content": content,
+                    "template": "markdown"
+                },
+                timeout=15
+            )
+            result = resp.json()
+            if result.get("code") == 200:
+                print("✅ PushPlus 推送成功!")
+                return True
+            print(f"❌ PushPlus 推送失败: {result.get('msg')}")
+            return False
+        except Exception as e:
+            print(f"❌ PushPlus 推送异常: {str(e)}")
+            return False
+
+    # 通道二：企业微信群机器人 Webhook
+    message = {
+        "msgtype": "markdown",
+        "markdown": {
+            "content": markdown_content
+        }
+    }
+    try:
+        print("📤 正在发送企业微信消息...")
+        response = requests.post(webhook_url, json=message, timeout=10)
+
+        if response.status_code == 200:
+            result = response.json()
+            if result.get('errcode') == 0:
+                print("✅ 企业微信推送成功!")
+                return True
+            print(f"❌ 企业微信推送失败: {result.get('errmsg')}")
+            return False
+        print(f"❌ 企业微信 API 错误: HTTP {response.status_code}")
+        return False
+
+    except Exception as e:
+        print(f"❌ 发送企业微信消息时发生错误: {str(e)}")
+        return False
+
+
 def _build_wecom_digest(account_name, gist_url, articles, display_count, now):
-    """构建企业微信摘要卡片内容（display_count 控制列表条数以便裁剪长度）"""
+    """构建摘要卡片内容（display_count 控制列表条数以便裁剪长度）"""
     article_list = ""
     for i in range(display_count):
         article = articles[i]
@@ -845,12 +910,12 @@ def _build_wecom_digest(account_name, gist_url, articles, display_count, now):
 
 def send_to_wechat_with_gist_link(account_name, gist_url, webhook_url, articles):
     """
-    发送企业微信卡片消息（包含文章列表，可选 Gist 链接）
+    发送摘要卡片消息（包含文章列表，可选 Gist 链接）
 
     Args:
         account_name: 公众号名称
         gist_url: Gist 链接（可为 None，此时仅推送标题列表）
-        webhook_url: 企业微信 webhook 地址
+        webhook_url: 企业微信 webhook 地址（PushPlus 模式下忽略）
         articles: 文章列表
     """
     # 使用北京时间（UTC+8）
@@ -865,32 +930,8 @@ def send_to_wechat_with_gist_link(account_name, gist_url, webhook_url, articles)
     if len(content.encode('utf-8')) > WECOM_MAX_BYTES:
         content = content.encode('utf-8')[:WECOM_MAX_BYTES].decode('utf-8', errors='ignore') + '…'
 
-    message = {
-        "msgtype": "markdown",
-        "markdown": {
-            "content": content
-        }
-    }
-
-    try:
-        print(f"📤 正在发送企业微信卡片消息...")
-        response = requests.post(webhook_url, json=message, timeout=10)
-
-        if response.status_code == 200:
-            result = response.json()
-            if result.get('errcode') == 0:
-                print(f"✅ 企业微信推送成功!")
-                return True
-            else:
-                print(f"❌ 企业微信推送失败: {result.get('errmsg')}")
-                return False
-        else:
-            print(f"❌ 企业微信 API 错误: HTTP {response.status_code}")
-            return False
-
-    except Exception as e:
-        print(f"❌ 发送企业微信消息时发生错误: {str(e)}")
-        return False
+    print("📤 正在推送摘要卡片消息...")
+    return _post_markdown_message(webhook_url, f"📰 {account_name}", content)
 
 
 def send_no_new_articles_message(webhook_url):
@@ -898,15 +939,12 @@ def send_no_new_articles_message(webhook_url):
     发送无新文章通知
 
     Args:
-        webhook_url: 企业微信 webhook 地址
+        webhook_url: 企业微信 webhook 地址（PushPlus 模式下忽略）
     """
     # 使用北京时间（UTC+8）
     now = datetime.now(CST).strftime('%Y-%m-%d %H:%M')
 
-    message = {
-        "msgtype": "markdown",
-        "markdown": {
-            "content": f"""# 📰 公众号文章更新
+    content = f"""# 📰 公众号文章更新
 
 **公众号**: 本次无新文章推送
 **更新时间**: {now}
@@ -914,28 +952,9 @@ def send_no_new_articles_message(webhook_url):
 ---
 <font color="info">WeSum AI 摘要助手</font>
 """
-        }
-    }
 
-    try:
-        print(f"📤 正在发送无新文章通知...")
-        response = requests.post(webhook_url, json=message, timeout=10)
-
-        if response.status_code == 200:
-            result = response.json()
-            if result.get('errcode') == 0:
-                print(f"✅ 通知发送成功!")
-                return True
-            else:
-                print(f"❌ 通知发送失败: {result.get('errmsg')}")
-                return False
-        else:
-            print(f"❌ 企业微信 API 错误: HTTP {response.status_code}")
-            return False
-
-    except Exception as e:
-        print(f"❌ 发送通知时发生错误: {str(e)}")
-        return False
+    print("📤 正在发送无新文章通知...")
+    return _post_markdown_message(webhook_url, "📰 公众号文章更新", content)
 
 
 def send_rss_source_warning_message(webhook_url, dead_feeds):
@@ -946,7 +965,7 @@ def send_rss_source_warning_message(webhook_url, dead_feeds):
     而不是"恰好没有新文章"——这种静默失效曾让本项目停摆 8 个月。
 
     Args:
-        webhook_url: 企业微信 webhook 地址
+        webhook_url: 企业微信 webhook 地址（PushPlus 模式下忽略）
         dead_feeds: 返回 0 条内容的公众号名称列表
     """
     # 使用北京时间（UTC+8）
@@ -955,10 +974,7 @@ def send_rss_source_warning_message(webhook_url, dead_feeds):
     if len(dead_feeds) > 10:
         feed_names += f" 等 {len(dead_feeds)} 个"
 
-    message = {
-        "msgtype": "markdown",
-        "markdown": {
-            "content": f"""# ⚠️ WeSum RSS 源疑似失效
+    content = f"""# ⚠️ WeSum RSS 源疑似失效
 
 **更新时间**: {now}
 
@@ -972,28 +988,9 @@ def send_rss_source_warning_message(webhook_url, dead_feeds):
 > 请检查 RSS 源并更新配置，否则将无法收到文章推送。
 <font color="warning">WeSum AI 摘要助手</font>
 """
-        }
-    }
 
-    try:
-        print(f"📤 正在发送 RSS 源失效告警...")
-        response = requests.post(webhook_url, json=message, timeout=10)
-
-        if response.status_code == 200:
-            result = response.json()
-            if result.get('errcode') == 0:
-                print(f"✅ 告警发送成功!")
-                return True
-            else:
-                print(f"❌ 告警发送失败: {result.get('errmsg')}")
-                return False
-        else:
-            print(f"❌ 企业微信 API 错误: HTTP {response.status_code}")
-            return False
-
-    except Exception as e:
-        print(f"❌ 发送告警时发生错误: {str(e)}")
-        return False
+    print("📤 正在发送 RSS 源失效告警...")
+    return _post_markdown_message(webhook_url, "⚠️ WeSum RSS 源疑似失效", content)
 
 
 # ==================== 主程序 ====================
@@ -1013,7 +1010,7 @@ def main():
     print("4. AI 分类标签生成")
     print("5. AI 摘要生成")
     print("6. 创建 GitHub Gist")
-    print("7. 推送到企业微信")
+    print("7. 推送（PushPlus / 企业微信）")
     print("8. 保存已推送文章记忆")
     print()
     print("=" * 60)
@@ -1211,10 +1208,10 @@ def main():
 
     print()
 
-    # 推送到企业微信（使用 Gist 链接）
+    # 推送摘要卡片（PushPlus 优先，未配置时走企业微信）
     print()
     print("=" * 60)
-    print("推送到企业微信（Gist 链接）")
+    print("推送摘要卡片")
     print("=" * 60)
     print()
 
@@ -1232,7 +1229,7 @@ def main():
     print()
 
     if success:
-        print("✅ 企业微信推送成功！")
+        print("✅ 推送成功！")
 
         # 8. 保存已推送文章记忆
         print("\n[Step 8] 保存已推送文章记忆...")
@@ -1249,10 +1246,10 @@ def main():
         print(f"   - 本次文章：{len(processed_articles)} 篇")
         print(f"   - 历史记忆：{len(seen_links)} 篇")
         print(f"   - Gist 链接：{gist_url}")
-        print(f"   - 企业微信：卡片消息已发送")
+        print(f"   - 推送：卡片消息已发送")
         print()
         print("💡 用户操作：")
-        print("   1. 打开企业微信")
+        print("   1. 打开微信查看推送（pushplus 推送加 公众号）")
         print("   2. 点击卡片中的链接")
         print("   3. 查看完整的文章摘要（Markdown 格式）")
         print()
