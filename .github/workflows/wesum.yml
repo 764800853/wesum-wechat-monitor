@@ -43,6 +43,7 @@ jobs:
         LLM_BASE_URL=${{ vars.LLM_BASE_URL }}
         WECHAT_MODEL=${{ vars.WECHAT_MODEL }}
         WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
+        PUSHPLUS_TOKEN=${{ secrets.PUSHPLUS_TOKEN }}
         GITHUB_TOKEN=${{ secrets.PERSONAL_GITHUB_TOKEN }}
         WECHAT2RSS_DOMAIN=${{ vars.WECHAT2RSS_DOMAIN || 'wechat2rss.xlab.app' }}
         RSS_TOKEN=${{ secrets.RSS_TOKEN }}
